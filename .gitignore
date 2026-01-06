@@ -10,3 +10,5 @@ wheels/
 .venv
 docs/
 chroma_db/
+
+.env
