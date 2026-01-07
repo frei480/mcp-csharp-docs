@@ -12,3 +12,5 @@ docs/
 chroma_db/
 
 .env
+.continue/
+.vscode/
