@@ -78,7 +78,7 @@ def parse_markdown_table(table: str) -> list[dict[str, str | None]]:
 
 
 class ApiSdkChunkSplitter:
-    def split(self, markdown: str) -> list[dict[str, Any]]:
+    def split_text(self, markdown: str) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []
 
         # --- metadata уровня класса ---
