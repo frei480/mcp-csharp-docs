@@ -3,7 +3,6 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Optional
 
 # MCP библиотеки
 # Библиотеки для БД
@@ -12,12 +11,13 @@ import httpx
 
 # --- КОНФИГУРАЦИЯ ---
 from config import cfg
+
 DOCS_PATH = cfg.DOCS_PATH
 # URL локального AI движка на сервере (например, Ollama или LM Server)
 AI_SERVER_URL = cfg.AI_SERVER_URL
 
 # Модели (должны быть установлены на сервере)
-RERANK_MODEL_NAME = cfg.RERANK_MODEL 
+RERANK_MODEL_NAME = cfg.RERANK_MODEL
 EMBEDDING_MODEL_NAME = cfg.EMBEDDING_MODEL
 
 
@@ -64,6 +64,7 @@ async def get_embedding(text: str) -> list[float]:
         )
         return []
 
+
 async def rerank_documents(query: str, documents: list[str]) -> list[int]:
     if not documents:
         return []
@@ -71,7 +72,7 @@ async def rerank_documents(query: str, documents: list[str]) -> list[int]:
         logging.warning("RERANK_MODEL_NAME не установлен, пропускаем переранжирование.")
         return list(range(len(documents)))  # Возвращаем исходный порядок
 
-    docs_snippets = []
+    docs_snippets: list[str] = []
     for i, doc in enumerate(documents):
         # Ограничиваем сниппет до 400 символов, чтобы не перегружать reranker
         snippet = doc[:400] + "..." if len(doc) > 400 else doc
@@ -100,14 +101,14 @@ async def rerank_documents(query: str, documents: list[str]) -> list[int]:
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"].strip()
 
-        indices = []
+        indices: list[int] = []
         try:
             # Извлекаем все числа и преобразуем в int
             found_indices = [int(idx) for idx in re.findall(r"\d+", content)]
             # Фильтруем, чтобы индексы были в пределах допустимого диапазона
             indices = [idx for idx in found_indices if 0 <= idx < len(documents)]
             # Уникализируем и сохраняем порядок первого появления
-            seen = set()
+            seen: set[int] = set()
             unique_indices = []
             for idx in indices:
                 if idx not in seen:
@@ -139,6 +140,7 @@ async def rerank_documents(query: str, documents: list[str]) -> list[int]:
         logging.error(f"Ошибка при переранжировании документов: {e}", exc_info=True)
         return list(range(min(5, len(documents))))  # Возвращаем дефолтный порядок
 
+
 def extract_markdown_links(text: str) -> list[str]:
     # Ищет как [текст](файл.md), так и <файл.md>
     pattern = r"(?:\]\(([^)]+\.md)\)|<([^>]+\.md)>)"
@@ -146,9 +148,10 @@ def extract_markdown_links(text: str) -> list[str]:
     # Возвращаем только первый элемент из кортежа, который содержит найденную ссылку
     return [link[0] if link[0] else link[1] for link in found_links]
 
+
 async def resolve_and_fetch_content(
     link_target: str, source_file_path: str, seen_paths: set[str], max_chars: int = 800
-) -> Optional[str]:
+) -> str | None:
     source_path = Path(source_file_path).parent
 
     # Нормализация link_target: удаляем якоря (#хеш)

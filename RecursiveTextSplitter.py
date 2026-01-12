@@ -1,7 +1,6 @@
 # --- КЛАСС: RECURSIVE TEXT SPLITTER ---
 
 import re
-from typing import List
 
 
 class RecursiveTextSplitter:
@@ -18,93 +17,18 @@ class RecursiveTextSplitter:
             # r"(?<=\.)", r"(?<=\?)", r"(?<=!)" 
         ]
 
-    def split_text(self, text: str) -> List[str]:
+    def split_text(self, text: str) -> list[str]:
         if not text:
             return []
-
+    
         # Убедимся, что chunk_size > chunk_overlap
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk_overlap must be less than chunk_size")
-
-        final_chunks = []
-        current_text = text
-
-        for separator in self.separators:
-            if not current_text:
-                break # Если текст уже полностью разбит, выходим
-
-            # Если текущий разделитель - это пустая строка, то разбиваем по символам
-            if separator == "":
-                final_chunks.extend(self._split_by_char(current_text))
-                current_text = ""
-                break # После посимвольного разбиения дальнейшие разделители не нужны
-
-            # Разделяем по текущему разделителю
-            parts = current_text.split(separator)
-
-            # Временно собираем чанки, чтобы потом объединить их с перекрытием
-            temp_chunks_for_separator = []
-            current_chunk_builder = []
-            current_len = 0
-
-            for part in parts:
-                if not part.strip() and len(current_chunk_builder) == 0:
-                    continue # Пропускаем пустые части в начале или между разделителями
-
-                # Длина текущей части (+ длина разделителя, если это не последняя часть)
-                part_with_sep_len = len(part) + len(separator)
-
-                if current_len + part_with_sep_len <= self.chunk_size:
-                    current_chunk_builder.append(part)
-                    current_len += part_with_sep_len
-                else:
-                    # Текущая часть не помещается, сохраняем текущий чанк
-                    if current_chunk_builder:
-                        temp_chunks_for_separator.append(separator.join(current_chunk_builder).strip())
-
-                    # Если текущая часть сама по себе слишком велика, 
-                    # обрабатываем её рекурсивно или посимвольно (если это последний разделитель)
-                    if part_with_sep_len > self.chunk_size:
-                        if separator == self.separators[-1]: # Если это самый "мелкий" разделитель, то уже по символам
-                             temp_chunks_for_separator.extend(self._split_by_char(part))
-                        else:
-                            # Для более "грубых" разделителей, просто добавляем, если она все равно большая
-                            # и она будет дальше обработана следующим разделителем.
-                            # Это может привести к чанкам > chunk_size временно, которые будут разбиты далее.
-                            temp_chunks_for_separator.append(part.strip())
-
-                        current_chunk_builder = []
-                        current_len = 0
-                    else:
-                        # Начинаем новый чанк с текущей части
-                        current_chunk_builder = [part]
-                        current_len = part_with_sep_len
-
-            # Добавляем последний чанк, если он есть
-            if current_chunk_builder:
-                temp_chunks_for_separator.append(separator.join(current_chunk_builder).strip())
-
-            # После обработки всех частей для текущего разделителя, объединяем их с перекрытием
-            # и подготавливаем для следующего шага
-            processed_chunks_for_this_separator = []
-            for j, chunk in enumerate(temp_chunks_for_separator):
-                if not chunk: continue
-
-                # Добавляем перекрытие из предыдущего чанка, если это не первый чанк
-                if j > 0 and self.chunk_overlap > 0:
-                    prev_chunk = temp_chunks_for_separator[j-1]
-                    overlap = prev_chunk[-self.chunk_overlap:]
-                    # Избегаем дублирования, если overlap уже в начале chunk
-                    if not chunk.startswith(overlap):
-                        chunk = overlap + chunk
-
-                processed_chunks_for_this_separator.append(chunk)
+    
+        return self._split_recursive_robust(text, self.separators)
 
 
-            return self._split_recursive_robust(text, self.separators)
-
-
-    def _split_recursive_robust(self, text: str, separators: List[str]) -> List[str]:
+    def _split_recursive_robust(self, text: str, separators: list[str]) -> list[str]:
         if not text:
             return []
 
@@ -176,8 +100,8 @@ class RecursiveTextSplitter:
         # Фильтрация пустых строк, которые могут появиться
         return [chunk for chunk in final_chunks if chunk]
 
-    def _split_by_char(self, text: str) -> List[str]:
-        chunks = []
+    def _split_by_char(self, text: str) -> list[str]:
+        chunks: list[str] = []
         if not text:
             return chunks
 

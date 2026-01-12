@@ -1,15 +1,19 @@
 [project]
 name = "mcp-csharp-docs"
 version = "0.1.0"
-description = "Add your description here"
+description = "GraphRAG MCP server for C# documentation with Neo4j"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "beautifulsoup4>=4.14.3",
     "chromadb>=1.4.0",
+    "fastmcp>=0.9.0",
     "httpx>=0.28.1",
     "markdown-it-py>=4.0.0",
     "mcp>=1.25.0",
+    "neo4j>=5.20.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
     "python-dotenv>=1.2.1",
     "rank-bm25>=0.2.2",
     "requests>=2.32.5",

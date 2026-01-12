@@ -1,25 +1,32 @@
-import os
 import asyncio
 import logging
-import httpx
+import os
 import re
 import subprocess
-from typing import List, Dict, Set, Optional
 from pathlib import Path
-from bs4 import BeautifulSoup
-from rank_bm25 import BM25Okapi 
-# MCP библиотеки
-from mcp.server.fastmcp import FastMCP
+from typing import Any
+from urllib.parse import urljoin
 
 # Библиотеки для БД
 import chromadb
+import httpx
+from bs4 import BeautifulSoup
 
-# Сплиттеры текста
-from RecursiveMarkdownTextSplitter import RecursiveMarkdownSplitter
+# MCP библиотеки
+from mcp.server.fastmcp import FastMCP
+from rank_bm25 import BM25Okapi
+
 from ApiSdkSplitter import ApiSdkChunkSplitter
 
 # --- КОНФИГУРАЦИЯ ---
 from config import cfg
+
+# GraphRAG модули
+from graphrag_index import GraphRAGIndexer
+from graphrag_query import GraphRAGQuery
+
+# Сплиттеры текста
+from RecursiveMarkdownTextSplitter import RecursiveMarkdownSplitter
 
 # URL репозитория Git с документацией (HTTPS или SSH)
 GIT_REPO_URL = cfg.GIT_REPO_URL
@@ -29,7 +36,7 @@ DOCS_PATH = cfg.DOCS_PATH
 AI_SERVER_URL = cfg.AI_SERVER_URL
 
 # Модели (должны быть установлены на сервере)
-RERANK_MODEL_NAME = cfg.RERANK_MODEL 
+RERANK_MODEL_NAME = cfg.RERANK_MODEL
 EMBEDDING_MODEL_NAME = cfg.EMBEDDING_MODEL
 
 CHUNK_SIZE = cfg.CHUNK_SIZE
@@ -39,13 +46,28 @@ COLLECTION_NAME = cfg.COLLECTION_NAME
 REGISTRY_COLLECTION_NAME = cfg.REGISTRY_COLLECTION_NAME
 
 # Инициализация логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 # Инициализация клиентов
 http_client = httpx.AsyncClient(timeout=120.0)
 chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
-registry_collection = chroma_client.get_or_create_collection(name=REGISTRY_COLLECTION_NAME)
+registry_collection = chroma_client.get_or_create_collection(
+    name=REGISTRY_COLLECTION_NAME
+)
+
+# Инициализация GraphRAG компонентов
+try:
+    graphrag_indexer = GraphRAGIndexer(http_client)
+    graphrag_query_system = GraphRAGQuery(http_client, collection)
+    logging.info("GraphRAG компоненты инициализированы")
+except Exception as e:
+    logging.error(f"Ошибка при инициализации GraphRAG: {e}", exc_info=True)
+    graphrag_indexer = None
+    graphrag_query_system = None
+
 
 # --- GIT SYNC ---
 def sync_docs_repo():
@@ -55,43 +77,56 @@ def sync_docs_repo():
         if not os.path.exists(DOCS_PATH):
             # Клонирование
             logging.info(f"Клонирование репозитория {GIT_REPO_URL} в {DOCS_PATH}...")
-            subprocess.run(["git", "clone", "--depth", "1", GIT_REPO_URL, DOCS_PATH], check=True)
+            subprocess.run(
+                ["git", "clone", "--depth", "1", GIT_REPO_URL, DOCS_PATH], check=True
+            )
             logging.info("Репозиторий клонирован успешно.")
         else:
             # Pull (обновление)
             logging.info(f"Обновление репозитория в {DOCS_PATH}...")
-            result = subprocess.run(["git", "pull"], cwd=DOCS_PATH, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                ["git", "pull"],
+                cwd=DOCS_PATH,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
             if "Already up to date" not in result.stdout:
                 logging.info("Документация обновлена.")
             else:
                 logging.info("Документация актуальна.")
     except subprocess.CalledProcessError as e:
         logging.error(f"Ошибка Git при синхронизации: {e.cmd} - {e.stderr}")
-        raise # Перевыбрасываем ошибку, чтобы синхронизация не продолжалась с поврежденным репозиторием
+        raise  # Перевыбрасываем ошибку, чтобы синхронизация не продолжалась с поврежденным репозиторием
     except Exception as e:
         logging.error(f"Непредвиденная ошибка синхронизации: {e}")
         raise
 
+
 # --- ЛИНКИ ---
-def extract_markdown_links(text: str) -> List[str]:
+def extract_markdown_links(text: str) -> list[str]:
     # Ищет как [текст](файл.md), так и <файл.md>
-    pattern = r'(?:\]\(([^)]+\.md)\)|<([^>]+\.md)>)'
+    pattern = r"(?:\]\(([^)]+\.md)\)|<([^>]+\.md)>)"
     found_links = re.findall(pattern, text)
     # Возвращаем только первый элемент из кортежа, который содержит найденную ссылку
     return [link[0] if link[0] else link[1] for link in found_links]
 
 
-async def resolve_and_fetch_content(link_target: str, source_file_path: str, seen_paths: Set[str], max_chars: int = 800) -> Optional[str]:
+async def resolve_and_fetch_content(
+    link_target: str, source_file_path: str, seen_paths: set[str], max_chars: int = 800
+) -> str | None:
     source_path = Path(source_file_path).parent
-    
+
     # Нормализация link_target: удаляем якоря (#хеш)
-    link_target_clean = link_target.split('#')[0]
-    
+    link_target_clean = link_target.split("#")[0]
+
     target_path = Path(link_target_clean)
-    
+
     absolute_target: Path
     if not target_path.is_absolute():
-        absolute_target = (Path(DOCS_PATH) / source_path.relative_to(DOCS_PATH) / target_path).resolve()
+        absolute_target = (
+            Path(DOCS_PATH) / source_path.relative_to(DOCS_PATH) / target_path
+        ).resolve()
     else:
         # Если ссылка абсолютная, убеждаемся, что она находится внутри DOCS_PATH
         if not str(target_path).startswith(str(DOCS_PATH)):
@@ -107,32 +142,40 @@ async def resolve_and_fetch_content(link_target: str, source_file_path: str, see
 
         absolute_target_str = str(absolute_target).replace(os.sep, "/")
         if absolute_target_str in seen_paths:
-            return None # Уже обрабатывали этот файл
-        
+            return None  # Уже обрабатывали этот файл
+
         if not absolute_target.exists() or not absolute_target.is_file():
-            logging.debug(f"Связанный файл не найден или не является файлом: {absolute_target}")
+            logging.debug(
+                f"Связанный файл не найден или не является файлом: {absolute_target}"
+            )
             return None
-        
-        if absolute_target.suffix.lower() != '.md':
+
+        if absolute_target.suffix.lower() != ".md":
             logging.debug(f"Связанный файл не Markdown: {absolute_target}")
             return None
 
         seen_paths.add(absolute_target_str)
         with open(absolute_target, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(max_chars * 2) # Читаем немного больше, чтобы потом обрезать красиво
+            content = f.read(
+                max_chars * 2
+            )  # Читаем немного больше, чтобы потом обрезать красиво
             # Удаляем заголовки, чтобы не дублировать информацию или не сбивать контекст
             # и оставляем только часть текста
-            content_cleaned = re.sub(r'#+\s.*', '', content).strip()
+            content_cleaned = re.sub(r"#+\s.*", "", content).strip()
             return f"\n\n--- Связанный документ ({absolute_target.name}): ---\n{content_cleaned[:max_chars]}..."
     except Exception as e:
-        logging.error(f"Ошибка при разрешении/получении связанного контента для {link_target} (из {source_file_path}): {e}")
+        logging.error(
+            f"Ошибка при разрешении/получении связанного контента для {link_target} (из {source_file_path}): {e}"
+        )
         return None
+
 
 # --- ИНДЕКСАЦИЯ ---
 def choose_splitter(text: str):
-    if "| Имя | Описание |" in text or "класс" in text:        
+    if "| Имя | Описание |" in text or "класс" in text:
         return ApiSdkChunkSplitter()
     return RecursiveMarkdownSplitter(CHUNK_SIZE)
+
 
 def sync_index():
     """
@@ -145,17 +188,21 @@ def sync_index():
         # ШАГ 1: Синхронизация файлов с Git
         sync_docs_repo()
     except Exception as e:
-        logging.error(f"Не удалось синхронизировать репозиторий: {e}. Пропускаем индексацию.")
+        logging.error(
+            f"Не удалось синхронизировать репозиторий: {e}. Пропускаем индексацию."
+        )
         return
 
     # ШАГ 2: Подготовка к индексации
     logging.info("Запуск индексации...")
     docs_path = Path(DOCS_PATH)
     if not docs_path.exists():
-        logging.warning(f"Путь документации {DOCS_PATH} не найден. Невозможно проиндексировать.")
+        logging.warning(
+            f"Путь документации {DOCS_PATH} не найден. Невозможно проиндексировать."
+        )
         return
 
-    db_files_map: Dict[str, float] = {}
+    db_files_map: dict[str, float] = {}
     try:
         registry_data = registry_collection.get(include=["metadatas"])
         if registry_data and registry_data["ids"]:
@@ -165,14 +212,18 @@ def sync_index():
                     mtime = registry_data["metadatas"][i].get("mtime", 0)
                     db_files_map[file_path] = mtime
                 else:
-                    logging.warning(f"Отсутствуют метаданные для файла в реестре: {file_path}")
-                    db_files_map[file_path] = 0 # Считаем, что нужно обновить
+                    logging.warning(
+                        f"Отсутствуют метаданные для файла в реестре: {file_path}"
+                    )
+                    db_files_map[file_path] = 0  # Считаем, что нужно обновить
         logging.info(f"В реестре ChromaDB найдено записей: {len(db_files_map)}")
     except Exception as e:
-        logging.error(f"Ошибка чтения реестра из ChromaDB: {e}. Начинаем с чистого реестра.")
+        logging.error(
+            f"Ошибка чтения реестра из ChromaDB: {e}. Начинаем с чистого реестра."
+        )
         db_files_map = {}
 
-    disk_files_map: Dict[str, float] = {}
+    disk_files_map: dict[str, float] = {}
     for file_path in docs_path.rglob("*.md"):
         try:
             mtime = os.path.getmtime(file_path)
@@ -186,7 +237,9 @@ def sync_index():
     db_paths = set(db_files_map.keys())
 
     new_files = disk_paths - db_paths
-    modified_files = {p for p in disk_paths & db_paths if disk_files_map[p] > db_files_map[p]}
+    modified_files = {
+        p for p in disk_paths & db_paths if disk_files_map[p] > db_files_map[p]
+    }
     deleted_files = db_paths - disk_paths
 
     total_changes = len(new_files) + len(modified_files) + len(deleted_files)
@@ -194,27 +247,33 @@ def sync_index():
         logging.info("Синхронизация не требуется: изменений нет.")
         return
 
-    logging.info(f"Обнаружено изменений: Новых: {len(new_files)}, Изменено: {len(modified_files)}, Удалено: {len(deleted_files)}")
+    logging.info(
+        f"Обнаружено изменений: Новых: {len(new_files)}, Изменено: {len(modified_files)}, Удалено: {len(deleted_files)}"
+    )
 
     # ШАГ 3: Обработка изменений
     # Используем синхронный httpx.Client для функции get_sync_embedding
     # в контексте to_thread, чтобы избежать проблем с asyncio
     sync_client = httpx.Client(timeout=120.0)
-    
+
     def get_sync_embedding(text):
         try:
             resp = sync_client.post(
                 f"{AI_SERVER_URL}/embeddings",
-                json={"model": EMBEDDING_MODEL_NAME, "input": text}
+                json={"model": EMBEDDING_MODEL_NAME, "input": text},
             )
             resp.raise_for_status()
             data = resp.json()
             if "data" in data and len(data["data"]) > 0:
                 return data["data"][0]["embedding"]
-            logging.error(f"Ответ от сервера эмбеддингов не содержит 'data' или он пуст: {data}")
-            return [0.0] * 768 # Возвращаем вектор нулей при ошибке
+            logging.error(
+                f"Ответ от сервера эмбеддингов не содержит 'data' или он пуст: {data}"
+            )
+            return [0.0] * 768  # Возвращаем вектор нулей при ошибке
         except httpx.HTTPStatusError as e:
-            logging.error(f"HTTP ошибка при получении эмбеддинга: {e.response.status_code} - {e.response.text}")
+            logging.error(
+                f"HTTP ошибка при получении эмбеддинга: {e.response.status_code} - {e.response.text}"
+            )
             return [0.0] * 768
         except Exception as e:
             logging.error(f"Ошибка при получении эмбеддинга: {e}")
@@ -222,7 +281,6 @@ def sync_index():
 
     # text_splitter = RecursiveTextSplitter(CHUNK_SIZE, CHUNK_OVERLAP)
     # text_splitter = RecursiveMarkdownSplitter(CHUNK_SIZE)
-    
 
     if deleted_files:
         try:
@@ -239,40 +297,47 @@ def sync_index():
 
     for file_rel_path_str in files_to_process:
         try:
-            local_path = docs_path / Path(file_rel_path_str) # Соединяем базовый путь с относительным
+            local_path = docs_path / Path(
+                file_rel_path_str
+            )  # Соединяем базовый путь с относительным
             mtime = disk_files_map[file_rel_path_str]
-            
+
             # Проверяем, что файл существует и читаем его
             if not local_path.exists() or not local_path.is_file():
-                logging.warning(f"Файл не найден при обработке: {local_path}. Пропускаем.")
+                logging.warning(
+                    f"Файл не найден при обработке: {local_path}. Пропускаем."
+                )
                 continue
 
             with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
-              
+
             text_splitter = choose_splitter(text)
             chunks = text_splitter.split_text(text)
-            
+
             # Если файл был модифицирован, сначала удаляем старые чанки
             if file_rel_path_str in modified_files:
                 collection.delete(where={"source": file_rel_path_str})
-                logging.debug(f"Удалены старые чанки для модифицированного файла: {file_rel_path_str}")
-            
+                logging.debug(
+                    f"Удалены старые чанки для модифицированного файла: {file_rel_path_str}"
+                )
+
             chunk_ids = []
             chunk_documents = []
             chunk_metadatas = []
-            
+
             for i, chunk in enumerate(chunks):
                 chunk_text = chunk["text"].strip()
-                if not chunk_text:# if not chunk.strip(): # Пропускаем пустые чанки
+                if not chunk_text:  # if not chunk.strip(): # Пропускаем пустые чанки
                     continue
 
-                chunk_id = f"{file_rel_path_str.replace('/', '__')}__chunk_{i}" # Создаем уникальный ID
-                metadata ={"source": file_rel_path_str,
-                           "mtime": mtime,
-                           "chunk_index": i,
-                           **chunk.get("metadata", {})
-                           }
+                chunk_id = f"{file_rel_path_str.replace('/', '__')}__chunk_{i}"  # Создаем уникальный ID
+                metadata = {
+                    "source": file_rel_path_str,
+                    "mtime": mtime,
+                    "chunk_index": i,
+                    **chunk.get("metadata", {}),
+                }
                 chunk_ids.append(chunk_id)
                 # chunk_documents.append(chunk)
                 chunk_documents.append(chunk_text)
@@ -283,65 +348,88 @@ def sync_index():
                 # Фильтруем пустые эмбеддинги, чтобы избежать ошибок Chroma
                 valid_embeddings = [e for e in embeddings if e]
                 valid_chunk_ids = [chunk_ids[i] for i, e in enumerate(embeddings) if e]
-                valid_chunk_documents = [chunk_documents[i] for i, e in enumerate(embeddings) if e]
-                valid_chunk_metadatas = [chunk_metadatas[i] for i, e in enumerate(embeddings) if e]
+                valid_chunk_documents = [
+                    chunk_documents[i] for i, e in enumerate(embeddings) if e
+                ]
+                valid_chunk_metadatas = [
+                    chunk_metadatas[i] for i, e in enumerate(embeddings) if e
+                ]
 
                 if valid_embeddings:
                     collection.add(
-                        ids=valid_chunk_ids, 
-                        documents=valid_chunk_documents, 
-                        embeddings=valid_embeddings, 
-                        metadatas=valid_chunk_metadatas
+                        ids=valid_chunk_ids,
+                        documents=valid_chunk_documents,
+                        embeddings=valid_embeddings,
+                        metadatas=valid_chunk_metadatas,
                     )
                     # Обновляем реестр для этого файла
                     registry_collection.upsert(
-                        ids=[file_rel_path_str], 
-                        documents=[file_rel_path_str], 
-                        metadatas=[{"mtime": mtime}]
+                        ids=[file_rel_path_str],
+                        documents=[file_rel_path_str],
+                        metadatas=[{"mtime": mtime}],
                     )
-                    logging.debug(f"Добавлены/обновлены {len(valid_chunk_ids)} чанков для файла: {file_rel_path_str}")
+                    logging.debug(
+                        f"Добавлены/обновлены {len(valid_chunk_ids)} чанков для файла: {file_rel_path_str}"
+                    )
                 else:
-                    logging.warning(f"Не удалось сгенерировать эмбеддинги для файла {file_rel_path_str}. Пропускаем его.")
+                    logging.warning(
+                        f"Не удалось сгенерировать эмбеддинги для файла {file_rel_path_str}. Пропускаем его."
+                    )
             else:
-                logging.info(f"Файл {file_rel_path_str} не содержит извлекаемых чанков после разбиения.")
-            
+                logging.info(
+                    f"Файл {file_rel_path_str} не содержит извлекаемых чанков после разбиения."
+                )
+
             processed_count += 1
-            if processed_count % 10 == 0: # Уменьшаем интервал логирования
-                logging.info(f"Обработано {processed_count}/{len(files_to_process)} файлов...")
+            if processed_count % 10 == 0:  # Уменьшаем интервал логирования
+                logging.info(
+                    f"Обработано {processed_count}/{len(files_to_process)} файлов..."
+                )
 
         except Exception as e:
-            logging.error(f"Критическая ошибка обработки файла {file_rel_path_str}: {e}", exc_info=True)
+            logging.error(
+                f"Критическая ошибка обработки файла {file_rel_path_str}: {e}",
+                exc_info=True,
+            )
 
     sync_client.close()
     logging.info("Индексация успешно завершена.")
 
+
 # --- AI ФУНКЦИИ ---
-async def get_embedding(text: str) -> List[float]:
+async def get_embedding(text: str) -> list[float]:
     if not text.strip():
         return []
     try:
         response = await http_client.post(
             f"{AI_SERVER_URL}/embeddings",
-            json={"model": EMBEDDING_MODEL_NAME, "input": text}
+            json={"model": EMBEDDING_MODEL_NAME, "input": text},
         )
         response.raise_for_status()
         data = response.json()
         if "data" in data and len(data["data"]) > 0 and "embedding" in data["data"][0]:
             return data["data"][0]["embedding"]
         logging.error(f"Неожиданный формат ответа от сервера эмбеддингов: {data}")
-        return [] 
+        return []
     except httpx.HTTPStatusError as e:
-        logging.error(f"HTTP ошибка при получении эмбеддинга: {e.response.status_code} - {e.response.text}")
+        logging.error(
+            f"HTTP ошибка при получении эмбеддинга: {e.response.status_code} - {e.response.text}"
+        )
         return []
     except Exception as e:
-        logging.error(f"Ошибка при получении эмбеддинга для текста '{text[:50]}...': {e}", exc_info=True)
+        logging.error(
+            f"Ошибка при получении эмбеддинга для текста '{text[:50]}...': {e}",
+            exc_info=True,
+        )
         return []
 
-async def rerank_documents(query: str, documents: List[str]) -> List[int]:
-    if not documents: return []
+
+async def rerank_documents(query: str, documents: list[str]) -> list[int]:
+    if not documents:
+        return []
     if not RERANK_MODEL_NAME:
         logging.warning("RERANK_MODEL_NAME не установлен, пропускаем переранжирование.")
-        return list(range(len(documents))) # Возвращаем исходный порядок
+        return list(range(len(documents)))  # Возвращаем исходный порядок
 
     docs_snippets = []
     for i, doc in enumerate(documents):
@@ -349,31 +437,33 @@ async def rerank_documents(query: str, documents: List[str]) -> List[int]:
         snippet = doc[:400] + "..." if len(doc) > 400 else doc
         docs_snippets.append(f"[{i}] {snippet}")
     docs_text = "\n".join(docs_snippets)
-    
+
     # Более четкий системный промпт
     system_prompt = "You are a document re-ranker. Given a query and a list of document snippets, identify the most relevant document snippets. Return ONLY a comma-separated list of the indices of the top 5 most relevant documents from the provided list. Example: 1, 3, 0, 5, 2"
-    user_prompt = f"Query: {query}\n\nDocuments:\n{docs_text}\n\nTop 5 relevant indices:"
-    
+    user_prompt = (
+        f"Query: {query}\n\nDocuments:\n{docs_text}\n\nTop 5 relevant indices:"
+    )
+
     try:
         response = await http_client.post(
             f"{AI_SERVER_URL}/chat/completions",
             json={
-                "model": RERANK_MODEL_NAME, 
+                "model": RERANK_MODEL_NAME,
                 "messages": [
-                    {"role": "system", "content": system_prompt}, 
-                    {"role": "user", "content": user_prompt}
-                ], 
-                "temperature": 0.1, 
-                "max_tokens": 50
-            }
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 50,
+            },
         )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"].strip()
-        
+
         indices = []
         try:
             # Извлекаем все числа и преобразуем в int
-            found_indices = [int(idx) for idx in re.findall(r'\d+', content)]
+            found_indices = [int(idx) for idx in re.findall(r"\d+", content)]
             # Фильтруем, чтобы индексы были в пределах допустимого диапазона
             indices = [idx for idx in found_indices if 0 <= idx < len(documents)]
             # Уникализируем и сохраняем порядок первого появления
@@ -383,25 +473,36 @@ async def rerank_documents(query: str, documents: List[str]) -> List[int]:
                 if idx not in seen:
                     unique_indices.append(idx)
                     seen.add(idx)
-            indices = unique_indices[:5] # Берем только топ-5
+            indices = unique_indices[:5]  # Берем только топ-5
         except Exception as parse_e:
-            logging.warning(f"Ошибка парсинга индексов reranker'а '{content}': {parse_e}. Возвращаем исходный порядок.")
-            indices = list(range(min(5, len(documents)))) # Возвращаем топ-5 по умолчанию
-        
+            logging.warning(
+                f"Ошибка парсинга индексов reranker'а '{content}': {parse_e}. Возвращаем исходный порядок."
+            )
+            indices = list(
+                range(min(5, len(documents)))
+            )  # Возвращаем топ-5 по умолчанию
+
         if not indices and len(documents) > 0:
             # Если reranker ничего не вернул, используем дефолтный порядок
-            logging.warning("Reranker не вернул индексы. Возвращаем исходный порядок документов.")
+            logging.warning(
+                "Reranker не вернул индексы. Возвращаем исходный порядок документов."
+            )
             indices = list(range(min(5, len(documents))))
-            
+
         return indices
     except httpx.HTTPStatusError as e:
-        logging.error(f"HTTP ошибка при переранжировании: {e.response.status_code} - {e.response.text}")
-        return list(range(min(5, len(documents)))) # Возвращаем дефолтный порядок
+        logging.error(
+            f"HTTP ошибка при переранжировании: {e.response.status_code} - {e.response.text}"
+        )
+        return list(range(min(5, len(documents))))  # Возвращаем дефолтный порядок
     except Exception as e:
         logging.error(f"Ошибка при переранжировании документов: {e}", exc_info=True)
-        return list(range(min(5, len(documents)))) # Возвращаем дефолтный порядок
+        return list(range(min(5, len(documents))))  # Возвращаем дефолтный порядок
 
-async def rerank_documents_bm25(query: str, retrieved_documents: list[str]) -> list[int]:
+
+async def rerank_documents_bm25(
+    query: str, retrieved_documents: list[str]
+) -> list[int]:
     """
     Переранжирует документы, используя BM25.
     Args:
@@ -431,11 +532,13 @@ async def rerank_documents_bm25(query: str, retrieved_documents: list[str]) -> l
     # 5. Создание списка пар (оценка BM25, оригинальный_индекс_документа)
     # Это позволит нам отсортировать и сохранить связь с исходным порядком
     # из retrieved_documents.
-    indexed_scores = list(enumerate(doc_scores)) # (original_index, score)
+    indexed_scores = list(enumerate(doc_scores))  # (original_index, score)
 
     # 6. Сортировка по оценкам BM25 в убывающем порядке
     # sorted() возвращает новый список, исходный не изменяется
-    reranked_indexed_scores = sorted(indexed_scores, key=lambda item: item[1], reverse=True)
+    reranked_indexed_scores = sorted(
+        indexed_scores, key=lambda item: item[1], reverse=True
+    )
 
     # 7. Извлечение только оригинальных индексов, теперь они упорядочены по BM25
     reranked_indices = [idx for idx, score in reranked_indexed_scores]
@@ -445,12 +548,20 @@ async def rerank_documents_bm25(query: str, retrieved_documents: list[str]) -> l
 
 
 # --- MCP SERVER ---
-mcp = FastMCP(name="tflex-csharp-docs", host="127.0.0.1", port=8000,)
+mcp = FastMCP(
+    name="tflex-csharp-docs",
+    host="127.0.0.1",
+    port=8000,
+)
 
-@mcp.tool(name="open_document", description="Markdown файлы документации C# SDK",)
+
+@mcp.tool(
+    name="open_document",
+    description="Markdown файлы документации C# SDK",
+)
 async def get_document(path: str) -> str:
     # Предотвращаем обход каталогов, даже если Path.resolve() не сработал бы
-    if ".." in path or path.startswith('/'):
+    if ".." in path or path.startswith("/"):
         raise ValueError("Invalid path: directory traversal attempt detected.")
 
     file_path = (Path(DOCS_PATH) / path).resolve()
@@ -464,28 +575,32 @@ async def get_document(path: str) -> str:
         raise ValueError("File not found")
 
     try:
-        logging.info(f"Чтение файла документации: {file_path}")        
+        logging.info(f"Чтение файла документации: {file_path}")
         return file_path.read_text(encoding="utf-8", errors="ignore")
     except Exception as e:
         logging.error(f"Ошибка при чтении файла {file_path}: {e}")
         raise ValueError(f"Failed to read file: {e}")
 
-@mcp.tool(name = "search_sdk_docs", description="Поиск в документации C# SDK по заданному запросу.",)
+
+@mcp.tool(
+    name="search_sdk_docs",
+    description="Поиск в документации C# SDK по заданному запросу.",
+)
 async def handle_call_tool(query: str) -> str:
-    if not query: 
+    if not query:
         return "Укажите поисковый запрос"
 
     logging.info(f"Получен поисковый запрос: '{query}'")
 
     query_embedding = await get_embedding(query)
-    if not query_embedding: 
+    if not query_embedding:
         logging.error("Не удалось получить эмбеддинг для запроса.")
         return "Ошибка при создании эмбеддинга для запроса. Проверьте AI сервер."
-        
+
     results = collection.query(
-        query_embeddings=[query_embedding], 
-        n_results=20, # Fetch more candidates for reranking
-        include=["documents", "metadatas"]
+        query_embeddings=[query_embedding],
+        n_results=20,  # Fetch more candidates for reranking
+        include=["documents", "metadatas"],
     )
 
     if not results or not results["documents"] or not results["documents"][0]:
@@ -494,77 +609,445 @@ async def handle_call_tool(query: str) -> str:
 
     docs = results["documents"][0]
     metadatas = results["metadatas"][0]
-    
+
     logging.info(f"Найдено {len(docs)} потенциальных документов до переранжирования.")
 
     # Переранжирование для получения наиболее релевантных
     reranked_indices = await rerank_documents_bm25(query, docs)
-        
+
     final_output = f"Результаты поиска по запросу: '{query}'\n\n"
-    
-    seen_linked_files = set() # Set для предотвращения дублирования связанных файлов
+
+    seen_linked_files = set()  # Set для предотвращения дублирования связанных файлов
 
     # Обрабатываем до 3-5 наиболее релевантных результатов после переранжирования
     # Выбираем не более 5, чтобы не перегружать контекст
-    for rank, original_idx in enumerate(reranked_indices[:5]): 
-        if original_idx >= len(docs): # Защита на случай некорректного индекса от reranker'а
+    for rank, original_idx in enumerate(reranked_indices[:5]):
+        if original_idx >= len(
+            docs
+        ):  # Защита на случай некорректного индекса от reranker'а
             continue
 
         doc_text = docs[original_idx]
-        source = metadatas[original_idx]["source"]
-        
+        source: str = metadatas[original_idx]["source"]
+
         final_output += f"--- Результат {rank + 1} (Источник: {source}) ---\n"
         final_output += f"{doc_text}\n"
-        
+
         # Ищем ссылки в тексте текущего чанка
         links = extract_markdown_links(doc_text)
-        
-        logging.debug(f"Найдено {len(links)} ссылок в результате {rank+1} из {source}")
+
+        logging.debug(
+            f"Найдено {len(links)} ссылок в результате {rank + 1} из {source}"
+        )
         # Подгружаем контекст по ссылкам
         for link in links:
             # Пытаемся загрузить связанный документ (ограничиваем его)
             extra_content = await resolve_and_fetch_content(
-                link, (Path(DOCS_PATH) / source).as_posix(), seen_linked_files, max_chars=1000 # Меньше символов для связанных документов
+                link,
+                (Path(DOCS_PATH) / source).as_posix(),
+                seen_linked_files,
+                max_chars=1000,  # Меньше символов для связанных документов
             )
             if extra_content:
                 final_output += extra_content
                 logging.debug(f"Добавлен связанный контент из {link}")
-    
+
         if not reranked_indices:
             final_output += "Хотя документы были найдены, переранжирование не выявило явно релевантных. Представлены общие результаты:\n\n"
             # Если reranker ничего не вернул, берем первые 3 по умолчанию
             for rank, (doc_text, metadata) in enumerate(zip(docs[:3], metadatas[:3])):
                 source = metadata["source"]
-                final_output += f"--- Общий Результат {rank + 1} (Источник: {source}) ---\n"
+                final_output += (
+                    f"--- Общий Результат {rank + 1} (Источник: {source}) ---\n"
+                )
                 final_output += f"{doc_text}\n"
     return final_output
 
-@mcp.tool()
-async def fetch_url_text(url: str) -> str:
-    """Download the text from a URL."""
-    resp = await http_client.get(url, timeout=10)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return soup.get_text(separator="\n", strip=True)
 
 @mcp.tool()
-async def fetch_page_links(url: str) -> List[str]:
+async def fetch_url_text(url: str) -> dict[str, Any]:
+    """
+    Извлекает структурированное содержимое со страницы по URL.
+    Возвращает словарь с заголовком, текстом, примерами кода, описаниями объектов и ссылками на сущности.
+    """
+    try:
+        resp = await http_client.get(url, timeout=15)
+        resp.raise_for_status()
+    except httpx.RequestError as exc:
+        logging.error(f"Ошибка при запросе {exc.request.url!r}: {exc}")
+        return {
+            "url": url,
+            "error": str(exc),
+            "title": "Error Page",
+            "general_text": [],
+            "code_examples": [],
+            "object_descriptions": [],
+            "potential_entity_links": [],
+            "structured_content": [],
+        }
+    except httpx.HTTPStatusError as exc:
+        logging.error(
+            f"HTTP ошибка {exc.response.status_code} при запросе {exc.request.url!r}."
+        )
+        return {
+            "url": url,
+            "error": f"HTTP Error {exc.response.status_code}",
+            "title": "Error Page",
+            "general_text": [],
+            "code_examples": [],
+            "object_descriptions": [],
+            "potential_entity_links": [],
+            "structured_content": [],
+        }
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    content: dict[str, Any] = {
+        "url": url,
+        "title": soup.title.string.strip() if soup.title else "No Title",
+        "general_text": [],
+        "code_examples": [],
+        "object_descriptions": [],
+        "potential_entity_links": [],
+        "structured_content": [],
+        "metadata": {
+            "description": soup.find("meta", attrs={"name": "description"})["content"]
+            if soup.find("meta", attrs={"name": "description"})
+            else ""
+        },
+    }
+
+    # --- 1. Извлечение заголовков и общего текста ---
+    for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "li", "td", "th"]):
+        text = tag.get_text(separator=" ", strip=True)
+        if text:
+            if len(text) > 5 and not any(
+                text.lower().startswith(nav_item)
+                for nav_item in ["home", "about", "contact"]
+            ):
+                content["general_text"].append(text)
+
+            if tag.name and tag.name.startswith("h"):
+                level = int(tag.name[1]) if len(tag.name) > 1 else 1
+                content["structured_content"].append(
+                    {"type": "heading", "level": level, "text": text}
+                )
+            elif tag.name == "p":
+                content["structured_content"].append(
+                    {"type": "paragraph", "text": text}
+                )
+
+    # --- 2. Извлечение блоков кода ---
+    for code_container in soup.find_all(["pre", "code"]):
+        code = code_container.get_text(separator="\n", strip=True)
+        if code:
+            is_csharp = False
+            csharp_keywords = [
+                "public",
+                "class",
+                "void",
+                "string",
+                "int",
+                "namespace",
+                "using",
+                "return",
+                "this",
+            ]
+            if any(keyword in code for keyword in csharp_keywords):
+                is_csharp = True
+
+            if code_container.has_attr("class") and any(
+                "csharp" in str(cls).lower() for cls in code_container.get("class", [])
+            ):
+                is_csharp = True
+
+            if is_csharp:
+                context_around_code = []
+                previous_sibling = code_container.find_previous_sibling(
+                    ["p", "h1", "h2", "h3", "h4", "div"]
+                )
+                if previous_sibling and previous_sibling.get_text(strip=True):
+                    context_around_code.append(previous_sibling.get_text(strip=True))
+
+                content["code_examples"].append(
+                    {
+                        "code": code,
+                        "context": " ".join(context_around_code).strip(),
+                        "language": "csharp",
+                    }
+                )
+
+    # --- 3. Извлечение описаний объектов ---
+    for desc_div in soup.find_all(
+        "div", class_=["api-description", "member-description", "summary-text"]
+    ):
+        description_text = desc_div.get_text(separator="\n", strip=True)
+        if description_text and len(description_text) > 20:
+            content["object_descriptions"].append(description_text)
+            content["structured_content"].append(
+                {"type": "object_description", "text": description_text}
+            )
+
+    for heading in soup.find_all(["h2", "h3", "h4"]):
+        heading_text = heading.get_text(strip=True).lower()
+        if (
+            "summary" in heading_text
+            or "remarks" in heading_text
+            or "description" in heading_text
+        ):
+            next_sibling = heading.find_next_sibling(["p", "div"])
+            if next_sibling and next_sibling.get_text(strip=True):
+                description_text = next_sibling.get_text(separator="\n", strip=True)
+                if description_text and len(description_text) > 50:
+                    content["object_descriptions"].append(description_text)
+                    content["structured_content"].append(
+                        {
+                            "type": "related_description",
+                            "heading": heading_text,
+                            "text": description_text,
+                        }
+                    )
+
+    # --- 4. Специальная логика для таблиц-оглавлений сущностей ---
+    regex = r"<tr[^>]*?>.*?<a href=\"(.*?)\">(.*?)</a></td><td>(.*?)</td></tr>"
+    matches = re.finditer(regex, resp.text, re.MULTILINE)
+    for match in matches:
+        # Добавляем в potential_entity_links
+        entity_name = match.group(2).strip()
+        entity_url_abs = urljoin(url, match.group(1))
+        description_text = match.group(3).strip()
+        content["potential_entity_links"].append(
+            {
+                "name": entity_name,
+                "url": entity_url_abs,
+                "summary": description_text
+                if description_text
+                else "Description likely on linked page.",
+                "context": "Found in an API entity listing table.",
+            }
+        )
+
+    # Очистка и дедупликация general_text
+    content["general_text"] = list(dict.fromkeys(content["general_text"]))
+
+    return content
+
+
+@mcp.tool()
+async def fetch_page_links(url: str) -> list[str]:
     """Return a list of all URLs found on the given page."""
     resp = await http_client.get(url, timeout=10)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     # Extract all href attributes from <a> tags
-    links = [a['href'] for a in soup.find_all('a', href=True)]
+    links = [a["href"] for a in soup.find_all("a", href=True)]
     return links
+
+
+@mcp.tool(
+    name="graphrag_index_document",
+    description="Индексация документа с использованием GraphRAG (двухфазный extraction: сущности → связи)",
+)
+async def graphrag_index_document(file_path: str) -> str:
+    """
+    Индексация одного документа с использованием GraphRAG.
+    Извлекает сущности и связи, сохраняет в Neo4j граф знаний.
+
+    Args:
+        file_path: Относительный путь к файлу документации
+
+    Returns:
+        Статус индексации
+    """
+    if not graphrag_indexer:
+        return "Ошибка: GraphRAG индексатор не инициализирован. Проверьте подключение к Neo4j и LMStudio."
+
+    try:
+        # Проверка пути
+        if ".." in file_path or file_path.startswith("/"):
+            return "Ошибка: Недопустимый путь"
+
+        full_path = (Path(DOCS_PATH) / file_path).resolve()
+
+        if not str(full_path).startswith(str(Path(DOCS_PATH).resolve())):
+            return "Ошибка: Путь находится вне директории документации"
+
+        if not full_path.exists() or not full_path.is_file():
+            return f"Ошибка: Файл не найден: {file_path}"
+
+        # Индексация файла
+        result = await graphrag_indexer.index_file(full_path)
+
+        if result["success"]:
+            return (
+                f"Успешно проиндексировано: {result['source_file']}\n"
+                f"Чанков обработано: {result['chunks_processed']}\n"
+                f"Чанков успешно: {result['chunks_successful']}\n"
+                f"Сущностей извлечено: {result['total_entities']}\n"
+                f"Связей извлечено: {result['total_relations']}"
+            )
+        else:
+            return f"Ошибка при индексации: {result.get('error', 'Неизвестная ошибка')}"
+
+    except Exception as e:
+        logging.error(
+            f"Ошибка при GraphRAG индексации файла {file_path}: {e}", exc_info=True
+        )
+        return f"Ошибка: {str(e)}"
+
+
+@mcp.tool(
+    name="graphrag_query",
+    description="Поиск с использованием GraphRAG (векторный поиск + граф знаний + генерация ответа)",
+)
+async def graphrag_query_tool(
+    query: str, use_graph: bool = True, generate_answer: bool = True
+) -> str:
+    """
+    Выполнение GraphRAG запроса.
+    Объединяет векторный поиск, контекст графа знаний и генерацию ответа через LLM.
+
+    Args:
+        query: Поисковый запрос
+        use_graph: Использовать ли граф знаний для контекста
+        generate_answer: Генерировать ли ответ через LLM
+
+    Returns:
+        Ответ на запрос с контекстом из графа знаний
+    """
+    if not graphrag_query_system:
+        return "Ошибка: GraphRAG query система не инициализирована. Проверьте подключение к Neo4j и LMStudio."
+
+    if not query or not query.strip():
+        return "Ошибка: Запрос не может быть пустым"
+
+    try:
+        result = await graphrag_query_system.query(
+            query=query,
+            n_results=20,
+            use_graph=use_graph,
+            generate_answer=generate_answer,
+        )
+
+        if not result["success"]:
+            return result.get("answer", "Ошибка при выполнении запроса")
+
+        # Форматирование ответа
+        response = f"# Результаты поиска: '{query}'\n\n"
+
+        if result.get("answer"):
+            response += f"## Ответ:\n\n{result['answer']}\n\n"
+
+        if result.get("subgraph_context"):
+            response += f"## Контекст графа знаний:\n\n{result['subgraph_context']}\n\n"
+
+        response += f"## Найдено документов: {result.get('document_count', 0)}\n"
+
+        # Добавляем топ-3 документа для справки
+        if result.get("documents"):
+            response += "\n### Топ документов:\n\n"
+            for i, doc in enumerate(result["documents"][:3]):
+                source = doc.get("metadata", {}).get("source", "Unknown")
+                response += f"{i + 1}. **{source}**\n{doc['text'][:300]}...\n\n"
+
+        return response
+
+    except Exception as e:
+        logging.error(f"Ошибка при GraphRAG запросе: {e}", exc_info=True)
+        return f"Ошибка при выполнении запроса: {str(e)}"
+
+
+@mcp.tool(
+    name="graphrag_sync_index",
+    description="Полная индексация документации с GraphRAG (синхронизация с Git + индексация всех файлов)",
+)
+async def graphrag_sync_index() -> str:
+    """
+    Полная индексация документации с использованием GraphRAG.
+    Синхронизирует с Git, индексирует все файлы с извлечением сущностей и связей.
+
+    Returns:
+        Статус индексации
+    """
+    if not graphrag_indexer:
+        return "Ошибка: GraphRAG индексатор не инициализирован. Проверьте подключение к Neo4j и LMStudio."
+
+    try:
+        # Синхронизация с Git
+        try:
+            sync_docs_repo()
+        except Exception as e:
+            logging.warning(
+                f"Не удалось синхронизировать с Git: {e}. Продолжаем с локальными файлами."
+            )
+
+        # Поиск всех файлов
+        docs_path = Path(DOCS_PATH)
+        if not docs_path.exists():
+            return f"Ошибка: Путь документации {DOCS_PATH} не найден"
+
+        md_files = list(docs_path.rglob("*.md"))
+        total_files = len(md_files)
+
+        if total_files == 0:
+            return "Не найдено Markdown файлов для индексации"
+
+        logging.info(f"Найдено {total_files} файлов для GraphRAG индексации")
+
+        # Индексация файлов
+        processed = 0
+        successful = 0
+        total_entities = 0
+        total_relations = 0
+
+        for file_path in md_files:
+            try:
+                result = await graphrag_indexer.index_file(file_path)
+                processed += 1
+
+                if result["success"]:
+                    successful += 1
+                    total_entities += result.get("total_entities", 0)
+                    total_relations += result.get("total_relations", 0)
+
+                # Небольшая задержка для избежания перегрузки
+                # await asyncio.sleep(0.1)
+
+                if processed % 10 == 0:
+                    logging.info(f"Обработано {processed}/{total_files} файлов...")
+
+            except Exception as e:
+                logging.error(
+                    f"Ошибка при индексации файла {file_path}: {e}", exc_info=True
+                )
+
+        return (
+            f"GraphRAG индексация завершена:\n"
+            f"- Всего файлов: {total_files}\n"
+            f"- Обработано: {processed}\n"
+            f"- Успешно: {successful}\n"
+            f"- Сущностей извлечено: {total_entities}\n"
+            f"- Связей извлечено: {total_relations}"
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка при полной GraphRAG индексации: {e}", exc_info=True)
+        return f"Ошибка: {str(e)}"
+
 
 # --- ЕНДПОИНТ ДЛЯ РУЧНОЙ СИНХРОНИЗАЦИИ ---
 
 # Глобальный флаг для защиты от повторного запуска
 is_syncing = False
-@mcp.tool(name="sync_docs_index", description="Запуск индексации документации C# SDK.",)
+
+
+@mcp.tool(
+    name="sync_docs_index",
+    description="Запуск индексации документации C# SDK.",
+)
 async def run_sync_task():
     """
-    Обертка для запуска синхронной функции sync_index в отдельном потоке.    
+    Обертка для запуска синхронной функции sync_index в отдельном потоке.
     """
     global is_syncing
 

@@ -1,18 +1,17 @@
 import re
-from typing import List, Dict
 
 CODE_BLOCK_PATTERN = re.compile(
     r"```.*?\n.*?```|~~~.*?\n.*?~~~",
     re.DOTALL
 )
 
-def extract_code_blocks(text: str):
+def extract_code_blocks(text: str) -> tuple[str, dict[str, str]]:
     """
     Заменяет code blocks плейсхолдерами и возвращает:
     - очищенный текст
     - словарь placeholder -> code block
     """
-    code_blocks: Dict[str, str] = {}
+    code_blocks: dict[str, str] = {}
 
     def replacer(match):
         placeholder = f"__CODE_BLOCK_{len(code_blocks)}__"
@@ -22,7 +21,7 @@ def extract_code_blocks(text: str):
     clean_text = CODE_BLOCK_PATTERN.sub(replacer, text)
     return clean_text, code_blocks
 
-def restore_code_blocks(text: str, code_blocks: Dict[str, str]):
+def restore_code_blocks(text: str, code_blocks: dict[str, str]) -> str:
     for placeholder, code in code_blocks.items():
         text = text.replace(placeholder, code)
     return text
@@ -46,12 +45,12 @@ class RecursiveMarkdownSplitter:
             ""
         ]
 
-    def split_text(self, text: str) -> List[str]:
+    def split_text(self, text: str) -> list[dict[str, str]]:
         clean_text, code_blocks = extract_code_blocks(text)
         chunks = self._recursive_split(clean_text, self.separators)
         return [{"text": restore_code_blocks(chunk, code_blocks).strip()} for chunk in chunks if chunk.strip()]
 
-    def _recursive_split(self, text: str, separators: List[str]) -> List[str]:
+    def _recursive_split(self, text: str, separators: list[str]) -> list[str]:
         if len(text) <= self.max_chunk_size:
             return [text]
 
@@ -87,7 +86,7 @@ class RecursiveMarkdownSplitter:
 
         return chunks
 
-    def _force_split(self, text: str) -> List[str]:
+    def _force_split(self, text: str) -> list[str]:
         """
         Последний уровень — жёсткое деление по длине
         """
